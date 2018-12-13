@@ -524,12 +524,38 @@ impl Block for Battery {
         // If device is None, it has to be removable. Let's retry accessing the
         // power supply device. We want to use or_else here, to avoid
         // constructing a new device every time.
-        //let device_name_clone = self.device_name.clone();
-        // FIXME
-        //option_swap(&mut self.device,
-        //            move |d: Option<PowerSupplyDevice>|
-        //                d.or_else(move || PowerSupplyDevice::from_device(device_name_clone).ok())
-        //           );
+        let device_name_clone = self.device_name.clone();
+        let driver_clone = self.driver.clone();
+        let removable = false;
+        option_swap(&mut self.device, move |d: Option<Box<BatteryDevice>>| d.or_else(move || {
+            match driver_clone {
+                BatteryDriver::Upower => {
+                    match (
+                        removable,
+                        UpowerDevice::from_device(&device_name_clone)
+                    ) {
+                        (_, Ok(dev)) => {
+                            // FIXME do we need this? What does it do?
+                            // If yes, how do we get update_request here?
+                            //dev.monitor(id.clone(), update_request);
+                            Some(Box::new(dev))
+                        },
+                        (true, Err(_)) => None,
+                        (false, Err(_e)) => None,  // FIXME Can we bubble up the error somehow?
+                    }
+                },
+                BatteryDriver::Sysfs => {
+                    match (
+                        removable,
+                        PowerSupplyDevice::from_device(&device_name_clone)
+                    ) {
+                        (_, Ok(dev)) => Some(Box::new(dev)),
+                        (true, Err(_)) => None,
+                        (false, Err(_e)) => None,  // FIXME Can we bubble up the error somehow?
+                    }
+                },
+            }
+        }));
 
         // Check whether the device is available
         let (device, status) = {
