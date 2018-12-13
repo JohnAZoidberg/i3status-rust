@@ -347,9 +347,11 @@ pub struct Battery {
     output: TextWidget,
     id: String,
     update_interval: Duration,
-    device: Box<BatteryDevice>,
+    device: Option<Box<BatteryDevice>>,
+    device_name: String,
     format: FormatTemplate,
     driver: BatteryDriver,
+    removable: bool,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -363,6 +365,15 @@ impl Default for BatteryDriver {
     fn default() -> Self {
         BatteryDriver::Sysfs
     }
+}
+
+/// Options for displaying battery information.
+#[derive(Deserialize, Copy, Clone, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum ShowType {
+    Time,
+    Percentage,
+    Both,
 }
 
 /// Configuration for the [`Battery`](./struct.Battery.html) block.
@@ -393,6 +404,10 @@ pub struct BatteryConfig {
 
     /// The "driver" to use for powering the block. One of "sysfs" or "upower".
     pub driver: Option<BatteryDriver>,
+
+    /// Whether the battery is removable. Doesn't throw error if not found
+    #[serde(default = "BatteryConfig::default_removable")]
+    pub removable: bool,
 }
 
 impl BatteryConfig {
@@ -409,6 +424,10 @@ impl BatteryConfig {
     }
 
     fn default_upower() -> bool {
+        false
+    }
+
+    fn default_removable() -> bool {
         false
     }
 }
@@ -441,47 +460,117 @@ impl ConfigBlock for Battery {
         };
 
         let id = Uuid::new_v4().simple().to_string();
-        let device: Box<BatteryDevice> = match driver {
+        let device: Option<Box<BatteryDevice>> = match driver {
             BatteryDriver::Upower => {
-                let out = UpowerDevice::from_device(&block_config.device)?;
-                out.monitor(id.clone(), update_request);
-                Box::new(out)
+                match (
+                    block_config.removable,
+                    UpowerDevice::from_device(&block_config.device)
+                ) {
+                    (_, Ok(dev)) => {
+                          dev.monitor(id.clone(), update_request);
+                          Some(Box::new(dev))
+                        },
+                    (true, Err(_)) => None,
+                    (false, Err(e)) => return Err(e),
+                }
+                //let out = UpowerDevice::from_device(&block_config.device)?;
+                //out.monitor(id.clone(), update_request);
+                //Box::new(out)
             },
-            BatteryDriver::Sysfs => Box::new(PowerSupplyDevice::from_device(&block_config.device)?),
+            BatteryDriver::Sysfs => {
+                match (
+                    block_config.removable,
+                    PowerSupplyDevice::from_device(&block_config.device.clone())
+                ) {
+                    (_, Ok(dev)) => Some(Box::new(dev)),
+                    (true, Err(_)) => None,
+                    (false, Err(e)) => return Err(e),
+                }
+                //Box::new(PowerSupplyDevice::from_device(&block_config.device)?)
+            },
         };
+
+        // FIXME
+        // If the device does not exist and its not removable, throw an Error
+        // If it is removable, set to None or Some(dev) depending on its status
 
         Ok(Battery {
             id,
             update_interval: block_config.interval,
             output: TextWidget::new(config),
+            device_name: block_config.device,
             device,
             format: FormatTemplate::from_string(&format)?,
             driver,
+            removable: block_config.removable,
         })
     }
 }
 
+// TODO: Is there a builtin for this?
+fn option_swap<T, F>(opt: &mut Option<T>, f: F)
+    where F: FnOnce(Option<T>) -> Option<T>
+{
+    let myopt = opt.take();
+    let newopt = f(myopt);
+    *opt = newopt;
+}
+
 impl Block for Battery {
     fn update(&mut self) -> Result<Option<Duration>> {
-        // TODO: Maybe use dbus to immediately signal when the battery state changes.
+        // TODO: Maybe use dbus to immediately signal when the battery state
+        // changes.
 
-        let status = self.device.status()?;
+        // If device is None, it has to be removable. Let's retry accessing the
+        // power supply device. We want to use or_else here, to avoid
+        // constructing a new device every time.
+        //let device_name_clone = self.device_name.clone();
+        // FIXME
+        //option_swap(&mut self.device,
+        //            move |d: Option<PowerSupplyDevice>|
+        //                d.or_else(move || PowerSupplyDevice::from_device(device_name_clone).ok())
+        //           );
+
+        // Check whether the device is available
+        let (device, status) = {
+            let res_status = self.device.as_ref().map(|dev| dev.status());
+
+            match (self.removable, res_status) {
+                (true, Some(Err(_))) | (_, None) => {
+                    // Either the device was never initialized or there was
+                    // an error getting the status. Either way, it is probably
+                    // disconnected
+                    self.output.set_icon("bat_disconnected");
+                    self.output.set_text("".to_string());
+                    self.output.set_state(State::Idle);
+                    return Ok(Some(self.update_interval));
+                },
+                (false, Some(Err(e))) =>
+                    // Getting the status returned an error, but the device is
+                    // not marked as removable. Throw the error!
+                    { return Err(e) },
+                (_, Some(Ok(s))) =>
+                    // Getting the status worked, so the device must be Ok()
+                    (self.device.as_ref().unwrap(), s),
+            }
+        };
+
 
         if status == "Full" || status == "Not charging" {
             self.output.set_icon("bat_full");
             self.output.set_text("".to_string());
             self.output.set_state(State::Good);
         } else {
-            let capacity = self.device.capacity();
+            let capacity = device.capacity();
             let percentage = match capacity {
                 Ok(capacity) => format!("{}", capacity),
                 Err(_) => "×".into(),
             };
-            let time = match self.device.time_remaining() {
+            let time = match device.time_remaining() {
                 Ok(time) => format!("{}:{:02}", time / 60, time % 60),
                 Err(_) => "×".into(),
             };
-            let power = match self.device.power_consumption() {
+            let power = match device.power_consumption() {
                 Ok(power) => format!("{:.2}", power as f64 / 1000.0 / 1000.0),
                 Err(_) => "×".into(),
             };
